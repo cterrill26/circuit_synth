@@ -4,7 +4,7 @@ import smt_switch.primops as pops
 from smt_switch.sortkinds import BOOL, BV
 
 class CircuitEncoding:
-    def __init__(self, nodes, types, ops):
+    def __init__(self, nodes, types, ops, input_delays):
         if not isinstance(types, tuple):
             raise TypeError(f"CircuitSynth input types should be a tuple, got {type(types)}")
         if not isinstance(types[0], tuple):
@@ -14,7 +14,7 @@ class CircuitEncoding:
         if not isinstance(ops, tuple):
             raise TypeError(f"CircuitSynth input ops should be a tuple, got {type(ops)}")
         for op in ops:
-            if not isinstance(op, (nodes.SeqNode, nodes.CombNode)):
+            if not isinstance(op, (nodes.SeqNode, nodes.CombNode, nodes.SpecNode)):
                 raise TypeError(f"CircuitSynth input ops should have elements of type SeqNode or CombNode, got {type(op)}")
 
         self.nodes = nodes
@@ -37,14 +37,29 @@ class CircuitEncoding:
 
         self.input_vars = tuple(self.fts.make_inputvar(f"input_var[{i}]", self.solver.make_sort(BV, N)) for i,N in enumerate(types[0]))
         self.op_input_vars = tuple(tuple(self.fts.make_inputvar(f"op_input_var[{i}][{j}]", self.solver.make_sort(BV, N)) for j,N in enumerate(op.types[0])) for i,op in enumerate(ops))
-        self.op_output_vars = tuple(op.eval(*input_vars) for op,input_vars in zip(ops, self.op_input_vars))
+        self.op_output_vars = tuple(tuple(self.fts.make_inputvar(f"op_output_var[{i}][{j}]", self.solver.make_sort(BV, N)) for j,N in enumerate(op.types[1])) 
+                                    if isinstance(op, nodes.SpecNode) else 
+                                    op.eval(*input_vars) for i,(op,input_vars) in enumerate(zip(ops, self.op_input_vars)))
         self.output_vars = tuple(self.select_var(output_lvar, t) for output_lvar,t in zip(self.output_lvars, types[1]))
+
+        if input_delays is None:
+            input_delays = tuple(0 for _ in types[0])
+        self.input_delays = tuple(self.solver.make_term(d, self.solver.make_sort(BV, nodes.delay_width)) for d in input_delays)
+        # self.op_input_delays = tuple(tuple(self.select_delay(lvar, t) for lvar,t in zip(input_lvars, op.types[0])) for input_lvars,op in zip(self.op_input_lvars,ops))
+        self.op_input_delays = tuple(tuple(self.solver.make_symbol(f"op_input_delay[{i}][{j}]", self.solver.make_sort(BV, nodes.delay_width)) for j in range(len(op.types[0]))) for i,op in enumerate(ops))
+        self.op_output_delays = tuple(op.timing(*input_vars) for op,input_vars in zip(ops, self.op_input_delays))
+        self.output_delays = tuple(self.select_delay(output_lvar, t) for output_lvar,t in zip(self.output_lvars, types[1]))
 
         def flatten(tps):
             return tuple(x for tp in tps for x in tp)
         self.E_vars = flatten(self.op_input_lvars) + flatten(self.op_output_lvars) + self.output_lvars
         self.A_vars = self.input_vars
-        self.D_vars = flatten(self.op_input_vars) + flatten(op.state_vars for op in ops if isinstance(op, nodes.SeqNode))
+        self.D_vars = (
+            flatten(self.op_input_vars) + 
+            flatten(op.state_vars for op in ops if isinstance(op, nodes.SeqNode)) + 
+            flatten(output_vars for op,output_vars in zip(ops, self.op_output_vars) if isinstance(op, nodes.SpecNode)))
+        self.setups = flatten(op.setup for op in ops if isinstance(op, (nodes.SeqNode, nodes.SpecNode)))
+        self.holds = flatten(op.hold for op in ops if isinstance(op, (nodes.SeqNode, nodes.SpecNode)))
 
     def select_var(self, target_lvar, target_t):
         # dont include non-matching types in the resulting formula
@@ -64,6 +79,24 @@ class CircuitEncoding:
             res = self.solver.make_term(pops.Ite, self.solver.make_term(pops.Equal, target_lvar, lvar), var, res)
         return res
 
+    def select_delay(self, target_lvar, target_t):
+        # dont include non-matching types in the resulting formula
+        possible_pairs = []
+        for lvar, delay, t in zip(self.input_lvars, self.input_delays, self.types[0]):
+            if target_t == t:
+                possible_pairs.append((lvar, delay))
+
+        for output_lvars, output_delays, op in zip(self.op_output_lvars, self.op_output_delays, self.ops):
+            for lvar, delay, t in zip(output_lvars, output_delays, op.types[1]):
+                if target_t == t:
+                    possible_pairs.append((lvar, delay))
+
+        assert len(possible_pairs) != 0
+        res = possible_pairs[0][1]
+        for lvar,delay in possible_pairs[1:]:
+            res = self.solver.make_term(pops.Ite, self.solver.make_term(pops.Equal, target_lvar, lvar), delay, res)
+        return res
+
     @property
     def P_acyc(self):
         #the circuit must be acyclic
@@ -71,14 +104,28 @@ class CircuitEncoding:
         cond = []
         hardcoded_lvars = self.num_inputs
         for input_lvars, output_lvars, op in zip(self.op_input_lvars, self.op_output_lvars, self.ops):
-            # the output lvars are increasing by 1
             if isinstance(op, self.nodes.CombNode):
+                # the output lvars are increasing by 1
                 for input_lvar in input_lvars:
                     cond.append(self.solver.make_term(pops.BVUlt, input_lvar, output_lvars[0]))
-            else:
-                assert isinstance(op, self.nodes.SeqNode)
+            elif isinstance(op, self.nodes.SeqNode):
+                # the output lvars are increasing by 1
                 cond.append(self.solver.make_term(pops.Equal, output_lvars[0], self.solver.make_term(hardcoded_lvars, BV_LVAR)))
                 hardcoded_lvars += len(output_lvars)
+            else:
+                #special case here where the output lvars are NOT increasing by 1
+                assert isinstance(op, self.nodes.SpecNode)
+                for output_lvar,moore in zip(output_lvars, op.is_moores):
+                    if moore:
+                        cond.append(self.solver.make_term(pops.Equal, output_lvar, self.solver.make_term(hardcoded_lvars, BV_LVAR)))
+                        hardcoded_lvars += 1
+                    else:
+                        for input_lvar in input_lvars:
+                            cond.append(self.solver.make_term(pops.BVUlt, input_lvar, output_lvar))
+
+                        
+
+
         return functools.reduce(lambda a,b: self.solver.make_term(pops.And, a, b), cond)
 
     @property
@@ -96,11 +143,13 @@ class CircuitEncoding:
 
     @property
     def P_multi_out(self):
-        #successive outputs of an op should have lvar values increasing by 1
+        #successive outputs of an op should have lvar values increasing by 1, except for SpecNodes
         cond = [self.solver.make_term(1, self.solver.make_sort(BOOL))]
         BV_LVAR = self.solver.make_sort(BV, self.lvar_width)
         one = self.solver.make_term(1, BV_LVAR)
-        for output_lvars in self.op_output_lvars:
+        for output_lvars,op in zip(self.op_output_lvars, self.ops):
+            if isinstance(op, self.nodes.SpecNode):
+                continue
             for l,r in zip(output_lvars[:-1], output_lvars[1:]):
                 cond.append(self.solver.make_term(pops.Equal, self.solver.make_term(pops.BVAdd, l, one), r))
         return functools.reduce(lambda a,b: self.solver.make_term(pops.And, a, b), cond)
@@ -148,11 +197,21 @@ class CircuitEncoding:
         return functools.reduce(lambda a,b: self.solver.make_term(pops.And, a, b), cond)
 
     @property
-    def P_conn(self):
+    def P_conn_vars(self):
         #assert that the op input values are assigned to the corresponding sources
         cond = []
         for input_lvars,input_vars,op in zip(self.op_input_lvars, self.op_input_vars, self.ops):
             for lvar,var,t in zip(input_lvars, input_vars, op.types[0]):
                 cond.append(self.solver.make_term(pops.Equal, self.select_var(lvar, t), var))
+
+        return functools.reduce(lambda a,b: self.solver.make_term(pops.And, a, b), cond)
+
+    @property
+    def P_conn_delays(self):
+        #assert that the op input delays are assigned to the corresponding source delays
+        cond = []
+        for input_lvars,input_delays,op in zip(self.op_input_lvars, self.op_input_delays, self.ops):
+            for lvar,delay,t in zip(input_lvars, input_delays, op.types[0]):
+                cond.append(self.solver.make_term(pops.Equal, self.select_delay(lvar, t), delay))
 
         return functools.reduce(lambda a,b: self.solver.make_term(pops.And, a, b), cond)
